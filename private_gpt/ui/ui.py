@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from enum import Enum
 from pathlib import Path
 from typing import Any
+import psycopg2
 
 import gradio as gr  # type: ignore
 from fastapi import FastAPI
@@ -106,6 +107,118 @@ class PrivateGptUi:
         )
         self._system_prompt = self._get_default_system_prompt(self._default_mode)
 
+        # chat history variables & functions
+        self.all_chats = []
+
+    def _connect_to_db(self):
+        try:
+            connection = psycopg2.connect(
+                host="localhost",
+                port=5432,
+                database="postgres", # your database name
+                user="postgres",
+                password="your_password_here" # database password
+            )
+            return connection
+        except Exception as error:
+            print(f"Error connecting to the database: {error}")
+            return None
+    
+    def _chat_history_exists(self, user_message, assistant_response):
+        connection = self._connect_to_db()
+        if connection is None:
+            return False
+
+        try:
+            cursor = connection.cursor()
+            # Check for the existence of the user_message and assistant_response pair
+            select_query = """
+            SELECT id FROM chat_history 
+            WHERE user_message = %s AND assistant_response = %s;
+            """
+            cursor.execute(select_query, (user_message, assistant_response))
+            result = cursor.fetchone()
+            return result is not None
+        except Exception as error:
+            print(f"Error checking chat history: {error}")
+            return False
+        finally:
+            cursor.close()
+            connection.close()
+    
+    def _insert_chat_history(self, user_message, assistant_response):
+        if self._chat_history_exists(user_message, assistant_response):
+            # print("Chat history already exists. Skipping insertion.")
+            return
+
+        connection = self._connect_to_db()
+        if connection is None:
+            return
+
+        try:
+            cursor = connection.cursor()
+            insert_query = """
+            INSERT INTO chat_history (user_message, assistant_response)
+            VALUES (%s, %s);
+            """
+            cursor.execute(insert_query, (user_message, assistant_response))
+            connection.commit()
+            print("Chat history inserted successfully.")
+
+        except Exception as error:
+            print(f"Failed to insert chat history: {error}")
+        finally:
+            cursor.close()
+            connection.close()
+   
+    def _fetch_chat_history(self):
+        connection = self._connect_to_db()
+        if connection is None:
+            return []
+
+        try:
+            cursor = connection.cursor()
+            select_query = """
+                SELECT user_message, assistant_response 
+                FROM chat_history 
+                ORDER BY timestamp DESC;  -- Or ORDER BY id DESC if there's no timestamp column
+            """
+            cursor.execute(select_query)
+            results = cursor.fetchall()
+            return [(row[0], row[1]) for row in results]
+        except Exception as error:
+            print(f"Error fetching chat history: {error}")
+            return []
+        finally:
+            cursor.close()
+            connection.close()
+    
+    def load_response(self, selected_message):
+        for user_message, assistant_response in self._fetch_chat_history():
+            if user_message == selected_message:
+                return assistant_response
+        return ""
+
+    def _store_chat_history_in_db(self, messages):
+        if not messages:
+            print("No messages available to store.")
+            return
+
+        for chat_group in messages:
+            i = 0
+            while i < len(chat_group):
+                # Ensure the current and next message exist and are a user-assistant pair
+                if (i + 1 < len(chat_group) and 
+                    chat_group[i].role == MessageRole.USER and 
+                    chat_group[i + 1].role == MessageRole.ASSISTANT):
+                    user_message = chat_group[i].content
+                    assistant_response = chat_group[i + 1].content
+                    self._insert_chat_history(user_message, assistant_response)
+                    
+                    i += 2
+                else:
+                    i += 1
+
     def _chat(
         self, message: str, history: list[list[str]], mode: Modes, *_: Any
     ) -> Any:
@@ -159,10 +272,15 @@ class PrivateGptUi:
                     )
 
             # max 20 messages to try to avoid context overflow
-            return history_messages[:20]
+            return history_messages
 
         new_message = ChatMessage(content=message, role=MessageRole.USER)
         all_messages = [*build_history(), new_message]
+
+        if all_messages:
+            self.all_chats.append(all_messages) 
+            self._store_chat_history_in_db(self.all_chats)  # storing all chats into database         
+
         # If a system prompt is set, add it as a system message
         if self._system_prompt:
             all_messages.insert(
@@ -406,6 +524,29 @@ class PrivateGptUi:
                         max_lines=3,
                         interactive=False,
                     )
+
+                    # Rendering the chat history sections starts
+                    
+                    chat_history = self._fetch_chat_history()
+
+                    history_list = [user for user, _ in chat_history]
+                    default_history = history_list[0] if history_list else None
+
+                    history_dropdown = gr.Dropdown(
+                        choices=history_list,
+                        label="Chat History",
+                        interactive=True,
+                        value=default_history
+                    )
+                    history_output = gr.Textbox(label="Assistant Response", interactive=False)                    
+
+                    if default_history:
+                        history_output.value = self.load_response(default_history)
+
+                    history_dropdown.change(self.load_response, inputs=[history_dropdown], outputs=[history_output])
+
+                    # rendering chat history section ends
+
                     upload_button = gr.components.UploadButton(
                         "Upload File(s)",
                         type="filepath",

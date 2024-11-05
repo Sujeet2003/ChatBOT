@@ -174,7 +174,7 @@ class ChatService:
         )
         streaming_response = chat_engine.stream_chat(
             message=last_message if last_message is not None else "",
-            chat_history=chat_history,
+            chat_history=chat_history,  # responsible to show the chat history in command pallete
         )
         sources = [Chunk.from_node(node) for node in streaming_response.source_nodes]
         completion_gen = CompletionGen(
